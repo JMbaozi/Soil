@@ -6,17 +6,25 @@ import os
 import shutil
 import time
 import csv
+import traceback
+import glob
 from arcpy.sa import *
 
+# ===============================================================================
+# 类: SoilSampler (v13.0 最终集成版)
+# ===============================================================================
 class SoilSampler:
     """
-    SoilSampler v6.0 (智能自适应版)
+    SoilSampler v13.0
     
-    核心特性:
-    1. [智能数量]: 根据农田面积 * 密度，自动计算采样总数。
-    2. [智能间距]: 根据面积和点数，自动推算最佳网格大小(间距)。
-    3. [智能分配]: 按比例 (Ratio) 分配 Hot/Cold/Normal 的名额。
-    4. [全套输出]: GDB中间数据 + .lyrx样式 + .csv经纬度坐标。
+    [功能描述]:
+    自动化土壤采样规划工具。基于无人机能谱数据，结合地统计学原理，生成空间分布均匀且具有代表性的采样方案。
+    
+    [核心特性]:
+    1. [多要素并行]: 可同时处理 Total, K40, Bi214 等多个指标，互不干扰。
+    2. [自动步长]: 集成 '平均最近邻' 算法，自动计算克里金插值的最佳步长(Lag Size)，无需人工干预。
+    3. [栅格直出]: 插值结果直接保存为文件夹中的 .tif 文件，彻底解决数据库文件名截断(Kriging_Regi1)问题。
+    4. [智能抽样]: 使用 '网格分箱 + 距离约束' 算法，物理上强制保证采样点的空间分散性。
     """
 
     def __init__(self, 
@@ -24,316 +32,449 @@ class SoilSampler:
                  batch_config,
                  output_utm_sr,
                  
-                 # --- 智能模式参数 ---
-                 mode="auto", # "auto" (按面积算) 或 "fixed" (按固定数量算)
+                 # --- 数据源参数 ---
+                 value_fields=["total"],        # 要处理的能谱字段列表
+                 time_field="collection_time",  # 用于生成航线的时间字段
                  
-                 # A. 自动模式参数 (mode="auto")
-                 sampling_density=1.5,   # 每公顷采几个点
-                 min_sample_count=4,     # 无论地多小，至少采几个
-                 ratio_config={          # 各类别比例
-                     "hotPoint": 0.4, 
-                     "coldPoint": 0.4, 
-                     "normalPoint": 0.2
+                 # --- 智能采样参数 ---
+                 mode="auto",            # "auto"(按面积算) 或 "fixed"(固定数量)
+                 sampling_density=1.5,   # 密度: 每公顷采样的点数 (仅auto模式生效)
+                 min_sample_count=4,     # 保底: 无论地块多小，最少采样的点数
+                 
+                 # 比例配置: 决定各分类在总采样数中的占比
+                 ratio_config={          
+                     "hotPoint": 0.4,    # 高值区 (重点)
+                     "coldPoint": 0.4,   # 低值区 (重点)
+                     "normalPoint": 0.2  # 中值区 (参考)
                  },
                  
-                 # B. 固定模式参数 (mode="fixed")
-                 fixed_counts={
-                     "hotPoint": 5, 
-                     "coldPoint": 5, 
-                     "normalPoint": 3
-                 },
-                 fixed_grid_size=100,    # 固定模式下的起始网格大小
+                 # --- 固定模式参数 (仅mode="fixed"生效) ---
+                 fixed_counts={"hotPoint": 5, "coldPoint": 5, "normalPoint": 3},
+                 fixed_grid_size=100,    
                  
-                 # --- 常规参数 ---
-                 time_field="collection_time", 
-                 value_field="total", 
-                 kriging_model_str="SPHERICAL",
-                 kriging_range=300,
-                 line_point_distance="5 Meters",
+                 # --- 算法参数 ---
+                 kriging_model_str="SPHERICAL", # 插值模型 (SPHERICAL 球面 / EXPONENTIAL 指数)
+                 kriging_range="AUTO",          # 步长设置: "AUTO"自动计算，或填具体数字(如 3.35)
+                 line_point_distance="5 Meters",# 航线重采样间隔
                  classification_method="quantile", 
-                 symbology_template_lyrx=None,
-                 overwrite=True):
+                 symbology_template_lyrx=None,  # 样式模板路径
+                 overwrite=True):               # 是否覆盖
         
+        # 1. 基础路径赋值
         self.workspace = workspace
+        self.overwrite = overwrite
+        
+        # 定义栅格输出文件夹 (餐厅): 存放最终 .tif
+        self.grid_folder = os.path.join(os.path.dirname(workspace), "Grid")
+        # 定义临时缓存文件夹 (垃圾桶): 存放 ArcGIS 中间过程文件
+        self.scratch_folder = os.path.join(os.path.dirname(workspace), "_scratch_trash")
+        
+        # 初始化环境 (创建文件夹、设置工作空间)
+        self._setup_environment()
+        
+        # 2. 参数标准化
+        if isinstance(value_fields, str):
+            self.value_fields = [value_fields]
+        else:
+            self.value_fields = value_fields
+            
+        # 3. 保存配置
         self.batch_config = batch_config
         self.output_utm_sr = output_utm_sr
-        
         self.mode = mode
-        # 自动参数
         self.sampling_density = sampling_density
         self.min_sample_count = min_sample_count
         self.ratio_config = ratio_config
-        # 固定参数
         self.fixed_counts = fixed_counts
         self.fixed_grid_size = fixed_grid_size
         
         self.time_field = time_field
-        self.value_field = value_field
-        self.kriging_model = KrigingModelOrdinary(kriging_model_str, kriging_range)
         self.line_point_distance = line_point_distance
         self.classification_method = classification_method
         self.symbology_template_lyrx = symbology_template_lyrx
         
-        # !! 修复点: 之前漏了这一行 !!
-        self.overwrite = overwrite
+        self.kriging_model_str = kriging_model_str
+        self.kriging_range_param = kriging_range 
         
-        self._setup_environment()
         self.utm_sr = self._resolve_output_sr(output_utm_sr)
 
     def _setup_environment(self):
+        """
+        [系统功能] 初始化 ArcPy 环境与文件夹
+        """
         try:
+            # 创建必要的文件夹
+            if not os.path.exists(self.grid_folder): os.makedirs(self.grid_folder)
+            if not os.path.exists(self.scratch_folder): os.makedirs(self.scratch_folder)
+            
             arcpy.env.workspace = self.workspace
-            # 这里现在可以正确访问 self.overwrite 了
+            # [关键]: 将临时空间强制指向 _scratch_trash 文件夹
+            # 这能防止 Kriging_Regi1 等垃圾文件出现在 GDB 或 Grid 文件夹中
+            arcpy.env.scratchWorkspace = self.scratch_folder
             arcpy.env.overwriteOutput = self.overwrite
-            print(f"工作空间设置为: {self.workspace}")
+            
+            print(f"工作空间(GDB): {self.workspace}")
+            print(f"栅格输出(Grid): {self.grid_folder}")
         except Exception as e:
             raise Exception(f"设置工作空间失败: {e}")
 
     def _resolve_output_sr(self, sr_input):
+        """[辅助功能] 解析坐标系"""
         if not sr_input: return None
-        try:
-            return arcpy.SpatialReference(sr_input)
-        except:
-            return None
+        try: return arcpy.SpatialReference(sr_input)
+        except: return None
 
-    def _calculate_smart_params(self, farmland_fc):
+    def _cleanup_junk_files(self):
         """
-        根据农田面积计算：1.各类别数量, 2.推荐网格大小
+        [辅助功能] 清理残留的临时文件
         """
-        # 1. 计算面积 (公顷)
+        try:
+            # 清理 GDB 内可能残留的栅格
+            arcpy.env.workspace = self.workspace
+            junk = arcpy.ListRasters("Kriging_*")
+            if junk:
+                for r in junk:
+                    try: arcpy.management.Delete(r)
+                    except: pass
+            
+            # 清理 Grid 文件夹中可能的临时文件
+            if os.path.exists(self.grid_folder):
+                for f in os.listdir(self.grid_folder):
+                    if f.startswith("t_") and f.endswith(".tif"):
+                        try: os.remove(os.path.join(self.grid_folder, f))
+                        except: pass
+                        
+            # 清空垃圾桶文件夹
+            if os.path.exists(self.scratch_folder):
+                try: shutil.rmtree(self.scratch_folder)
+                except: pass
+        except: pass
+
+    def _calculate_optimal_lag_size(self, point_fc):
+        """
+        [算法] 自动计算最佳步长 (Lag Size)
+        原理: 使用 '平均最近邻' 工具，计算点与点之间的平均观测距离。
+        """
+        try:
+            result = arcpy.stats.AverageNearestNeighbor(point_fc, "EUCLIDEAN_DISTANCE")
+            avg_distance = float(result.getOutput(4))
+            return round(avg_distance, 6)
+        except Exception as e:
+            print(f"    !! 自动计算步长失败: {e}，将使用默认值 300。")
+            return 300.0
+
+    def _calculate_smart_params(self, farmland_fc, field_name):
+        """
+        [算法] 智能计算采样数量与网格
+        原理: 
+        1. 采样数 = 面积 * 密度。
+        2. 推荐网格 = sqrt(面积 / 采样数)。
+        """
         area_sq_meters = 0
         with arcpy.da.SearchCursor(farmland_fc, ["SHAPE@AREA"]) as cursor:
-            for row in cursor:
-                area_sq_meters += row[0]
+            for row in cursor: area_sq_meters += row[0]
         area_ha = area_sq_meters / 10000.0
         
-        print(f"    [智能计算] 农田面积: {area_ha:.2f} 公顷")
-
-        # 2. 计算总点数
+        # 计算总数
         total_needed = int(math.ceil(area_ha * self.sampling_density))
         if total_needed < self.min_sample_count:
             total_needed = self.min_sample_count
             
-        # 3. 按比例分配
+        # 分配比例
         current_counts = {}
         allocated = 0
         for cls, ratio in self.ratio_config.items():
             c = int(round(total_needed * ratio))
-            if c < 1: c = 1
+            if c < 1: c = 1 
             current_counts[cls] = c
             allocated += c
             
-        # 修正分配误差 (比如算出来总共少1个，加给占比最大的)
         if allocated < total_needed:
-             # 简单粗暴加给 normal
-             if "normalPoint" in current_counts:
-                 current_counts["normalPoint"] += (total_needed - allocated)
-             else:
-                 # 或者加给第一个键
-                 k = list(current_counts.keys())[0]
-                 current_counts[k] += (total_needed - allocated)
+             k = list(current_counts.keys())[0]
+             current_counts[k] += (total_needed - allocated)
             
-        # 4. 推算推荐网格大小 (理想间距)
-        # 公式: sqrt(面积 / 点数) * 系数
-        # 系数 0.8 是为了留有余地，避免太挤
+        # 计算网格
         if total_needed > 0:
             suggested_grid = math.sqrt(area_sq_meters / total_needed) * 0.8
         else:
-            suggested_grid = 100 # 默认
+            suggested_grid = 100
             
-        print(f"    [智能计算] 计划采样: {sum(current_counts.values())} 个 (配置: {current_counts})")
-        print(f"    [智能计算] 推荐网格: {suggested_grid:.1f} 米")
-        
+        print(f"      [智能参数] 农田:{area_ha:.2f}ha | 计划采样:{sum(current_counts.values())} | 网格:{suggested_grid:.1f}m")
         return current_counts, suggested_grid
+
+    def _get_distance(self, p1, p2):
+        return math.sqrt((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2)
+
+    def _is_valid_distance(self, new_point, existing_points, min_dist):
+        """[算法] 检查新点与已选点集的距离是否合格"""
+        for ep in existing_points:
+            dist = self._get_distance((new_point["x"], new_point["y"]), (ep["x"], ep["y"]))
+            if dist < min_dist: return False
+        return True
 
     def _sample_via_grid_binning(self, input_fc, counts_config, start_grid_size):
         """
-        网格分箱抽样 (支持动态网格缩放)
+        [算法] 内存网格分箱抽样 (Grid Binning)
+        原理: 在内存中建立虚拟网格，并加入硬性距离约束，防止点位过近。
         """
-        print(f"  步骤 6: 执行网格化采样 (起始网格: {start_grid_size:.1f}m)...")
-        
-        # 读取数据
+        # 1. 读取数据到内存
         data_pool = []
         with arcpy.da.SearchCursor(input_fc, ["OID@", "SHAPE@XY", "class"]) as cursor:
             for row in cursor:
                 if row[2] in counts_config: 
                     data_pool.append({"oid": row[0], "x": row[1][0], "y": row[1][1], "cls": row[2]})
-
-        if not data_pool:
-            print("    错误: 无有效点。")
-            return []
+        if not data_pool: return []
 
         total_needed = sum(counts_config.values())
-        current_grid = start_grid_size
         final_oids = []
         
-        # 尝试缩放网格
+        # 硬性最小距离：设为目标网格的一半，防止极端贴近
+        HARD_MIN_DISTANCE = start_grid_size * 0.5
+        
+        # 2. 自适应网格尝试 (最多15次)
+        current_grid = start_grid_size
         for attempt in range(15):
             # 分箱
             grid = {}
             for pt in data_pool:
                 k = (int(pt["y"]/current_grid), int(pt["x"]/current_grid))
                 if k not in grid: grid[k] = {cls: [] for cls in counts_config}
-                if pt["cls"] in grid[k]: grid[k][pt["cls"]].append(pt["oid"])
+                if pt["cls"] in grid[k]: grid[k][pt["cls"]].append(pt) # 存对象
 
             if len(grid) < total_needed:
-                # 格子不够，缩小
-                current_grid *= 0.85
-                continue
+                current_grid *= 0.85; continue
 
-            # 抽样
+            round_points = []
             round_oids = []
             available_keys = list(grid.keys())
-            # 优先级: Hot -> Cold -> Normal
             priority = ["hotPoint", "coldPoint", "normalPoint"]
             success = True
             
+            # 分层抽样
             for cls in priority:
                 if cls not in counts_config: continue
                 needed = counts_config[cls]
                 candidates = [k for k in available_keys if len(grid[k][cls]) > 0]
                 
                 if len(candidates) < needed:
-                    success = False
-                    break
+                    success = False; break
                 
-                picked = random.sample(candidates, needed)
-                for k in picked:
-                    round_oids.append(random.choice(grid[k][cls]))
-                    available_keys.remove(k)
+                picked_keys = random.sample(candidates, needed)
+                for k in picked_keys:
+                    # 随机选点
+                    chosen_pt = random.choice(grid[k][cls])
+                    # 额外检查距离 (防止边缘效应)
+                    if self._is_valid_distance(chosen_pt, round_points, HARD_MIN_DISTANCE):
+                        round_points.append(chosen_pt)
+                        round_oids.append(chosen_pt["oid"])
+                        available_keys.remove(k)
+                    else:
+                        success = False; break
+                if not success: break
             
-            if success:
-                print(f"    -> 成功! 最终网格: {current_grid:.1f} 米。")
+            if success and len(round_oids) == total_needed:
                 final_oids = round_oids
                 break
             else:
                 current_grid *= 0.85
 
-        # 保底随机
+        # 3. 保底机制 (距离约束随机)
         if not final_oids:
-            print(f"    !! 警告: 空间约束失败，执行随机抽样。")
-            for cls, num in counts_config.items():
-                 oids = [p["oid"] for p in data_pool if p["cls"] == cls]
-                 final_oids.extend(random.sample(oids, min(len(oids), num)))
+            print(f"      -> 网格法未收敛，切换至距离约束随机模式...")
+            for retry in range(50): # 尝试50次随机组合
+                temp_pts = []; temp_ids = []; failed = False
+                for cls in ["hotPoint", "coldPoint", "normalPoint"]:
+                    if cls not in counts_config: continue
+                    needed = counts_config[cls]
+                    pool = [p for p in data_pool if p["cls"] == cls]
+                    random.shuffle(pool)
+                    cnt = 0
+                    for p in pool:
+                        if self._is_valid_distance(p, temp_pts, HARD_MIN_DISTANCE):
+                            temp_pts.append(p); temp_ids.append(p["oid"]); cnt += 1
+                        if cnt == needed: break
+                    if cnt < needed: failed = True; break
+                if not failed: final_oids = temp_ids; break
+            
+            # 最后的底线: 纯随机
+            if not final_oids:
+                print("      !! 警告: 无法满足距离约束，执行纯随机。")
+                for cls, num in counts_config.items():
+                     oids = [p["oid"] for p in data_pool if p["cls"] == cls]
+                     final_oids.extend(random.sample(oids, min(len(oids), num)))
 
         return final_oids
 
     def run_batch(self):
-        print(f"开始批量处理 (v6.1 修正版)...")
-        
+        """
+        [主程序] 批量处理入口
+        """
+        print(f"开始批量处理 (v13.0 最终集成版)...")
+        # 预先清理垃圾桶
+        self._cleanup_junk_files()
+        if not os.path.exists(self.scratch_folder): os.makedirs(self.scratch_folder)
+
         for region in self.batch_config:
             region_id = region["id"]
-            print(f"\n=== 处理区域: {region_id} ===")
+            print(f"\n=== 正在处理区域: {region_id} ===")
             
-            kriging_raster = f"kriging_total_{region_id}"
-            uav_line = f"uav_route_{region_id}"
-            line_points = f"route_points_{region_id}"
-            projected_line_points = f"route_points_UTM_{region_id}"
-            merged_output_fc = f"sample_points_{region_id}"
-
+            # 1. 生成基础几何 (存入 GDB)
+            uav_line_base = f"Route_{region_id}"
+            line_points_base = f"Points_{region_id}"
             try:
-                # 1. 插值
-                print(f"  步骤 1: 插值...")
-                arcpy.env.extent = region["farmland"]; arcpy.env.mask = region["farmland"]
-                try: Kriging(region["points"], self.value_field, self.kriging_model).save(kriging_raster)
-                except: pass
-                finally: arcpy.env.mask = ""; arcpy.env.extent = ""
-
-                # 2-3. 路线与点
-                print(f"  步骤 2-3: 路线生成...")
-                if arcpy.Exists(uav_line): arcpy.management.Delete(uav_line)
-                arcpy.management.PointsToLine(region["points"], uav_line, "", self.time_field)
-                arcpy.management.GeneratePointsAlongLines(uav_line, line_points, "DISTANCE", self.line_point_distance)
-                
-                # 4. 提取
-                ExtractMultiValuesToPoints(line_points, [[kriging_raster, "krig_val"]], "NONE")
-
-                # 5. 分类
-                print(f"  步骤 5: 分类...")
-                vals = [row[0] for row in arcpy.da.SearchCursor(line_points, ["krig_val"]) if row[0] is not None]
-                if not vals: raise Exception("无有效值")
-                vals.sort()
-                p33, p66 = vals[int(len(vals)*0.33)], vals[int(len(vals)*0.66)]
-                
-                arcpy.management.AddField(line_points, "class", "TEXT")
-                with arcpy.da.UpdateCursor(line_points, ["krig_val", "class"]) as cursor:
-                    for row in cursor:
-                        if row[0] is None: row[1] = "NoData"
-                        elif row[0] < p33: row[1] = "coldPoint"
-                        elif row[0] < p66: row[1] = "normalPoint"
-                        else: row[1] = "hotPoint"
-                        cursor.updateRow(row)
-                
-                # 5b. 投影
-                arcpy.management.Project(line_points, projected_line_points, self.utm_sr)
-
-                # --- 步骤 6: 智能计算与抽样 ---
-                if self.mode == "auto":
-                    target_counts, start_grid = self._calculate_smart_params(region["farmland"])
-                else:
-                    target_counts = self.fixed_counts
-                    start_grid = self.fixed_grid_size
-                
-                selected_oids = self._sample_via_grid_binning(projected_line_points, target_counts, start_grid)
-
-                # 7. 导出
-                if not selected_oids: continue
-                print(f"  步骤 7: 导出数据...")
-                where_sql = f"OBJECTID IN ({','.join(map(str, selected_oids))})"
-                
-                if arcpy.Exists("tmp_exp"): arcpy.management.Delete("tmp_exp")
-                arcpy.management.MakeFeatureLayer(projected_line_points, "tmp_exp", where_sql)
-                if arcpy.Exists(merged_output_fc): arcpy.management.Delete(merged_output_fc)
-                arcpy.management.CopyFeatures("tmp_exp", merged_output_fc)
-                arcpy.management.Delete("tmp_exp")
-
-                # 8. 样式 (稳健)
-                try:
-                    if self.symbology_template_lyrx and arcpy.Exists(self.symbology_template_lyrx):
-                        print(f"  步骤 8: 应用样式...")
-                        time.sleep(1.0); arcpy.ClearWorkspaceCache_management()
-                        
-                        out_lyrx = os.path.join(os.path.dirname(self.workspace), f"{merged_output_fc}.lyrx")
-                        temp_tpl = os.path.join(os.path.dirname(self.workspace), f"Tpl_{region_id}.lyrx")
-                        if os.path.exists(temp_tpl): os.remove(temp_tpl)
-                        shutil.copy2(self.symbology_template_lyrx, temp_tpl)
-                        
-                        ln = f"{merged_output_fc}_Layer"
-                        if arcpy.Exists(ln): arcpy.management.Delete(ln)
-                        full_p = os.path.join(self.workspace, merged_output_fc)
-                        
-                        arcpy.management.MakeFeatureLayer(full_p, ln)
-                        arcpy.management.ApplySymbologyFromLayer(ln, temp_tpl)
-                        arcpy.management.SaveToLayerFile(ln, out_lyrx, "ABSOLUTE")
-                        arcpy.management.Delete(ln)
-                        if os.path.exists(temp_tpl): os.remove(temp_tpl)
-                        print(f"    成功!")
-                except Exception as e: print(f"    样式警告: {e}")
-
-                # 9. 导出CSV
-                print(f"  步骤 9: 导出 CSV...")
-                try:
-                    csv_f = os.path.join(os.path.dirname(self.workspace), f"Coords_{region_id}.csv")
-                    wgs84 = arcpy.SpatialReference(4326)
-                    with open(csv_f, 'w', newline='', encoding='utf-8-sig') as f:
-                        writer = csv.writer(f)
-                        writer.writerow(["ID", "Class", "Lon", "Lat", "Value"])
-                        full_p = os.path.join(self.workspace, merged_output_fc)
-                        with arcpy.da.SearchCursor(full_p, ["OID@", "SHAPE@", "class", "krig_val"]) as cur:
-                            for r in cur:
-                                pt = r[1].projectAs(wgs84).firstPoint
-                                v = f"{r[3]:.2f}" if r[3] else "0"
-                                writer.writerow([r[0], r[2], f"{pt.X:.6f}", f"{pt.Y:.6f}", v])
-                    print(f"    成功! {csv_f}")
-                except Exception as e: print(f"    CSV警告: {e}")
-
-                print(f"*** 区域 {region_id} 完成 ***")
-
+                if arcpy.Exists(uav_line_base): arcpy.management.Delete(uav_line_base)
+                arcpy.management.PointsToLine(region["points"], uav_line_base, "", self.time_field)
+                if arcpy.Exists(line_points_base): arcpy.management.Delete(line_points_base)
+                arcpy.management.GeneratePointsAlongLines(uav_line_base, line_points_base, "DISTANCE", self.line_point_distance)
             except Exception as e:
-                print(f"!! 区域 {region_id} 错误: {e}")
-                arcpy.env.mask = ""
+                print(f"!! 基础几何生成失败: {e}"); continue
 
-        print("\n!! 全部完成 !!")
+            # 2. 自动计算步长 (Auto Lag Size)
+            current_lag_size = 300.0
+            if self.kriging_range_param == "AUTO":
+                print(f"  [自动分析] 计算点间距...")
+                current_lag_size = self._calculate_optimal_lag_size(region["points"])
+                print(f"  [自动分析] 最佳步长: {current_lag_size:.4f} 米")
+            else:
+                current_lag_size = float(self.kriging_range_param)
+
+            current_kriging_model = KrigingModelOrdinary(self.kriging_model_str, current_lag_size)
+
+            # --- 内层循环: 遍历要素 ---
+            for field_name in self.value_fields:
+                print(f"\n  >>> 正在处理要素: [{field_name}] ...")
+                
+                # 定义文件名 (栅格存 Grid，矢量存 GDB)
+                kriging_tif_name = f"Kriging_{region_id}_{field_name}.tif"
+                kriging_tif_path = os.path.join(self.grid_folder, kriging_tif_name)
+                
+                working_points = f"WorkPt_{region_id}_{field_name}"
+                projected_points = f"ProjPt_{region_id}_{field_name}"
+                final_sample_fc = f"Sample_{region_id}_{field_name}"
+
+                try:
+                    # -------------------------------------------------
+                    # A. 克里金插值 (Direct CopyRaster 方案)
+                    # -------------------------------------------------
+                    arcpy.env.extent = region["farmland"]
+                    arcpy.env.mask = region["farmland"]
+                    
+                    try: 
+                        if os.path.exists(kriging_tif_path):
+                            try: arcpy.management.Delete(kriging_tif_path)
+                            except: os.remove(kriging_tif_path)
+                        
+                        # 1. 计算 Kriging (中间临时文件自动进入 _scratch_trash)
+                        krig_obj = Kriging(region["points"], field_name, current_kriging_model)
+                        
+                        # 2. CopyRaster 直接保存为 TIFF (绕过 GDB 命名限制)
+                        arcpy.management.CopyRaster(
+                            in_raster=krig_obj, 
+                            out_rasterdataset=kriging_tif_path,
+                            pixel_type="32_BIT_FLOAT",
+                            format="TIFF"
+                        )
+                        print(f"      -> 插值成功: {kriging_tif_name}")
+                        
+                        # 3. 计算统计值 (优化显示)
+                        try: arcpy.management.CalculateStatistics(kriging_tif_path)
+                        except: pass
+                        
+                    except Exception as e:
+                        print(f"      !! 插值失败: {e}")
+                        print(arcpy.GetMessages(2)) # 打印底层错误
+                        raise
+                    finally: 
+                        arcpy.env.mask = ""; arcpy.env.extent = ""
+
+                    # -------------------------------------------------
+                    # B. 提取与分类 (从 TIFF 提取)
+                    # -------------------------------------------------
+                    if arcpy.Exists(working_points): arcpy.management.Delete(working_points)
+                    arcpy.management.CopyFeatures(line_points_base, working_points)
+                    ExtractMultiValuesToPoints(working_points, [[kriging_tif_path, "krig_val"]], "NONE")
+                    
+                    vals = [row[0] for row in arcpy.da.SearchCursor(working_points, ["krig_val"]) if row[0] is not None]
+                    if not vals: continue
+                    vals.sort()
+                    p33, p66 = vals[int(len(vals)*0.33)], vals[int(len(vals)*0.66)]
+                    
+                    arcpy.management.AddField(working_points, "class", "TEXT")
+                    with arcpy.da.UpdateCursor(working_points, ["krig_val", "class"]) as cursor:
+                        for row in cursor:
+                            if row[0] is None: row[1] = "NoData"
+                            elif row[0] < p33: row[1] = "coldPoint"
+                            elif row[0] < p66: row[1] = "normalPoint"
+                            else: row[1] = "hotPoint"
+                            cursor.updateRow(row)
+                    
+                    # -------------------------------------------------
+                    # C. 投影与抽样
+                    # -------------------------------------------------
+                    if arcpy.Exists(projected_points): arcpy.management.Delete(projected_points)
+                    arcpy.management.Project(working_points, projected_points, self.utm_sr)
+                    
+                    if self.mode == "auto": t_counts, start_grid = self._calculate_smart_params(region["farmland"], field_name)
+                    else: t_counts, start_grid = self.fixed_counts, self.fixed_grid_size
+                    
+                    sel_oids = self._sample_via_grid_binning(projected_points, t_counts, start_grid)
+                    if not sel_oids: continue
+
+                    # -------------------------------------------------
+                    # D. 导出数据 (GDB)
+                    # -------------------------------------------------
+                    print(f"      4. 导出采样点...")
+                    sql = f"OBJECTID IN ({','.join(map(str, sel_oids))})"
+                    if arcpy.Exists("tmp_exp"): arcpy.management.Delete("tmp_exp")
+                    arcpy.management.MakeFeatureLayer(projected_points, "tmp_exp", sql)
+                    if arcpy.Exists(final_sample_fc): arcpy.management.Delete(final_sample_fc)
+                    arcpy.management.CopyFeatures("tmp_exp", final_sample_fc)
+                    arcpy.management.Delete("tmp_exp")
+
+                    # -------------------------------------------------
+                    # E. 应用样式
+                    # -------------------------------------------------
+                    if self.symbology_template_lyrx and arcpy.Exists(self.symbology_template_lyrx):
+                        time.sleep(0.5); arcpy.ClearWorkspaceCache_management()
+                        out_lyrx = os.path.join(os.path.dirname(self.workspace), f"{final_sample_fc}.lyrx")
+                        tpl_copy = os.path.join(os.path.dirname(self.workspace), f"Tpl_{region_id}_{field_name}.lyrx")
+                        shutil.copy2(self.symbology_template_lyrx, tpl_copy)
+                        tmp_lyr = f"{final_sample_fc}_Layer"
+                        if arcpy.Exists(tmp_lyr): arcpy.management.Delete(tmp_lyr)
+                        full_p = os.path.join(self.workspace, final_sample_fc)
+                        arcpy.management.MakeFeatureLayer(full_p, tmp_lyr)
+                        arcpy.management.ApplySymbologyFromLayer(tmp_lyr, tpl_copy)
+                        arcpy.management.SaveToLayerFile(tmp_lyr, out_lyrx, "ABSOLUTE")
+                        arcpy.management.Delete(tmp_lyr)
+                        if os.path.exists(tpl_copy): os.remove(tpl_copy)
+                        print(f"      -> 样式已应用: {os.path.basename(out_lyrx)}")
+
+                    # -------------------------------------------------
+                    # F. 导出 CSV
+                    # -------------------------------------------------
+                    try:
+                        csv_name = f"Coords_{region_id}_{field_name}.csv"
+                        csv_path = os.path.join(os.path.dirname(self.workspace), csv_name)
+                        wgs84 = arcpy.SpatialReference(4326)
+                        with open(csv_path, 'w', newline='', encoding='utf-8-sig') as f:
+                            writer = csv.writer(f)
+                            writer.writerow(["ID", "Class", "Lon", "Lat", f"Value_{field_name}"]) 
+                            fp = os.path.join(self.workspace, final_sample_fc)
+                            with arcpy.da.SearchCursor(fp, ["OID@", "SHAPE@", "class", "krig_val"]) as cur:
+                                for r in cur:
+                                    pt = r[1].projectAs(wgs84).firstPoint
+                                    v = f"{r[3]:.2f}" if r[3] else "0"
+                                    writer.writerow([r[0], r[2], f"{pt.X:.6f}", f"{pt.Y:.6f}", v])
+                        print(f"      -> 表格已导出: {csv_name}")
+                    except Exception as e:
+                        print(f"      (CSV错误: {e})")
+
+                except Exception as e:
+                    print(f"    !! 处理失败: {e}"); arcpy.env.mask = ""; continue
+        
+        # 运行结束，删除垃圾桶文件夹
+        self._cleanup_junk_files()
+        print("\n!! 采样任务全部完成 !!")
 
 
 
@@ -341,6 +482,142 @@ class SoilSampler:
 
 
 
+
+
+
+# ===============================================================================
+# SoilMapper (可视化制图逻辑)
+# 负责：打开 APRX，加载数据，调整范围，导出图片
+# ===============================================================================
+class SoilMapper:
+    """
+    SoilMapper v1.0
+    
+    功能:
+    1. 读取 SoilSampler 生成的 GDB 数据。
+    2. 将图层添加到 ArcGIS Pro 工程的地图中。
+    3. 导出布局为图片 (JPG/PNG)。
+    """
+
+    def __init__(self, aprx_path, map_name="Map", layout_name="Layout"):
+        self.aprx_path = aprx_path
+        self.map_name = map_name
+        self.layout_name = layout_name
+        self.aprx = None
+        
+        if not os.path.exists(self.aprx_path):
+            raise Exception(f"APRX 工程文件未找到: {self.aprx_path}")
+        
+        try:
+            self.aprx = arcpy.mp.ArcGISProject(self.aprx_path)
+            print(f"制图工具初始化成功: {os.path.basename(self.aprx_path)}")
+        except Exception as e:
+            raise Exception(f"无法加载 APRX: {e}")
+
+    def generate_map(self, gdb_path, region_id, field_name, output_folder, farmland_fc_path):
+        """
+        为指定的区域和要素生成地图图片
+        """
+        print(f"  [制图] 正在绘制: {region_id} - {field_name}")
+        
+        # 1. 构造文件名
+        kriging_name = f"kriging_{region_id}_{field_name}"
+        route_name = f"uav_route_{region_id}_Base" # 公共几何
+        sample_name = f"sample_points_{region_id}_{field_name}"
+        
+        # 2. 获取 Map 对象
+        m = self.aprx.listMaps(self.map_name)[0]
+        
+        # 3. 清理旧图层 (保留底图)
+        # 策略：删除名字里包含 kriging_, uav_route_, sample_points_ 的图层
+        for lyr in m.listLayers():
+            if any(x in lyr.name for x in ["kriging_", "uav_route_", "sample_points_", "Farmland"]):
+                m.removeLayer(lyr)
+        
+        # 4. 添加图层 (注意顺序：先底后顶，addLayer默认加在顶层，所以我们倒序加，或者用 addDataFromPath)
+        # 我们希望顺序 (从下到上): 插值图 -> 农田边界 -> 飞行路径 -> 采样点
+        
+        # A. 添加插值图 (最底层)
+        try:
+            krig_lyr = m.addDataFromPath(os.path.join(gdb_path, kriging_name))
+            # 简单的拉伸渲染
+            if krig_lyr.isRasterLayer:
+                sym = krig_lyr.symbology
+                if hasattr(sym, 'stretchType'):
+                    sym.stretchType = "PercentClip"
+                    # 尝试设置色带 (如果报错则忽略)
+                    try: sym.colorRamp = self.aprx.listColorRamps("Precipitation")[0]
+                    except: pass
+                    krig_lyr.symbology = sym
+        except: print(f"    警告: 无法添加插值图 {kriging_name}")
+
+        # B. 添加农田边界
+        try:
+            farm_lyr = m.addDataFromPath(farmland_fc_path)
+            # 设置为空心，黑色轮廓
+            if farm_lyr.isFeatureLayer:
+                sym = farm_lyr.symbology
+                sym.renderer.symbol.color = {'RGB': [0, 0, 0, 0]} # 透明填充
+                sym.renderer.symbol.outlineColor = {'RGB': [0, 0, 0, 100]} # 黑色轮廓
+                sym.renderer.symbol.outlineWidth = 1.5
+                farm_lyr.symbology = sym
+        except: pass
+
+        # C. 添加飞行路径
+        try:
+            route_lyr = m.addDataFromPath(os.path.join(gdb_path, route_name))
+            if route_lyr.isFeatureLayer:
+                sym = route_lyr.symbology
+                sym.renderer.symbol.color = {'RGB': [100, 100, 100, 60]} # 灰色
+                sym.renderer.symbol.width = 0.5
+                route_lyr.symbology = sym
+        except: pass
+
+        # D. 添加采样点 (最顶层)
+        try:
+            # 尝试查找有没有现成的 .lyrx 文件 (由 SoilSampler 生成的)
+            lyrx_path = os.path.join(os.path.dirname(gdb_path), f"{sample_name}.lyrx")
+            
+            if os.path.exists(lyrx_path):
+                # 如果有样式文件，直接添加样式文件
+                m.addDataFromPath(lyrx_path)
+            else:
+                # 如果没有，添加数据并设为红色大点
+                pt_lyr = m.addDataFromPath(os.path.join(gdb_path, sample_name))
+                if pt_lyr.isFeatureLayer:
+                    sym = pt_lyr.symbology
+                    sym.renderer.symbol.color = {'RGB': [255, 0, 0, 100]}
+                    sym.renderer.symbol.size = 10
+                    pt_lyr.symbology = sym
+        except: print(f"    警告: 无法添加采样点 {sample_name}")
+
+        # 5. 调整布局视图范围
+        l = self.aprx.listLayouts(self.layout_name)[0]
+        mf = l.listElements("MAPFRAME_ELEMENT")[0]
+        mf.map = m # 确保关联正确
+        
+        # 缩放到农田边界 (farm_lyr)
+        # 需要重新获取一下图层对象，因为刚刚添加进去
+        layers = m.listLayers()
+        target_layer = None
+        for lyr in layers:
+            # 找刚才添加的边界层
+            if lyr.supports("DataSource") and lyr.dataSource == farmland_fc_path:
+                target_layer = lyr
+                break
+        
+        if target_layer:
+            mf.camera.setExtent(mf.getLayerExtent(target_layer, False, True))
+            mf.camera.scale *= 1.2 # 稍微缩小一点，留出边距
+        
+        # 6. 导出
+        if not os.path.exists(output_folder): os.makedirs(output_folder)
+        out_jpg = os.path.join(output_folder, f"Map_{region_id}_{field_name}.jpg")
+        l.exportToJPEG(out_jpg, resolution=150)
+        print(f"    -> 图片已导出: {out_jpg}")
+
+    def save_project(self):
+        self.aprx.save()
 
 
 
