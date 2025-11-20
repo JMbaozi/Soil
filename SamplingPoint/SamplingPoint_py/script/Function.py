@@ -8,8 +8,9 @@
 主要特性：
 1. 高性能计算：利用 NumPy 向量化运算和内存数据流，极大减少磁盘 I/O 开销。
 2. 自适应参数：自动计算变异函数步长，适应不同尺度的地块。
-3. 智能布点：通过网格化与距离互斥算法，确保采样点空间分布均匀且具有代表性。
-4. 出版级制图：生成高分辨率地图，图例与色条严格对齐，视觉效果清新美观。
+3. 自动处理坐标系转换，并兼容无坐标系的情况
+4. 智能布点：通过网格化与距离互斥算法，确保采样点空间分布均匀且具有代表性。
+5. 出版级制图：生成高分辨率地图，视觉效果清新美观。
 """
 
 import os
@@ -27,6 +28,7 @@ from scipy.spatial import cKDTree
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.ticker import FuncFormatter
 import warnings
 
 # 忽略地理数据处理中常见的非致命警告
@@ -47,7 +49,7 @@ class PureSoilSampler:
                  boundary_data, 
                  value_fields=['total'], 
                  time_field='collection_time', 
-                 target_crs="EPSG:32650"): 
+                 target_crs="auto"): 
         """
         初始化采样器实例，加载数据并建立基础环境。
 
@@ -64,7 +66,19 @@ class PureSoilSampler:
         else: self.value_fields = value_fields
             
         self.time_field = time_field
-        self.target_crs = target_crs
+
+        # ========================================================
+        # [逻辑]: 自动投影判断
+        # ========================================================
+        if target_crs == "auto":
+            print("正在基于首个数据点识别最佳投影...")
+            # 传入原始点数据，函数内部只取第一个点计算，无需担心性能
+            self.target_crs = self._get_best_utm_epsg(points_data)
+            print(f"      -> 自动匹配为: {self.target_crs}")
+        else:
+            self.target_crs = target_crs
+            print(f"      -> 使用指定投影: {self.target_crs}")
+        # ========================================================
         
         # 定义不同采样类型的比例配置 (高值区:低值区:中值区)
         self.ratio_config = {"hotPoint": 0.4, "coldPoint": 0.4, "normalPoint": 0.2}
@@ -80,6 +94,53 @@ class PureSoilSampler:
         # 数据完整性校验
         if self.time_field not in self.gdf_pts.columns:
             raise ValueError(f"点数据中缺少时间字段: {self.time_field}")
+
+    def _get_best_utm_epsg(self, gdf):
+        """
+        [功能]: 根据第一个点的经纬度自动计算 UTM EPSG 代码
+        [逻辑]: 自动处理坐标系转换，并兼容无坐标系的情况
+        """
+        try:
+            # 1. 提取数据的第一个点 (GeoDataFrame格式)
+            first_pt_gdf = gdf.iloc[[0]]
+            
+            # 2. 检查原始数据是否有坐标系
+            if first_pt_gdf.crs is None:
+                print("      [警告] 输入数据丢失坐标系信息(CRS is None)！")
+                print("      -> 假设原始坐标为 WGS84 经纬度进行计算...")
+                # 假设它是经纬度，手动指定为 WGS84，不进行转换
+                first_pt_gdf.set_crs("EPSG:4326", inplace=True)
+            else:
+                # 如果有坐标系 (比如 CGCS2000)，则执行投影转换
+                # 将其转换为 WGS84，以便提取经度(Lon)和纬度(Lat)
+                first_pt_gdf = first_pt_gdf.to_crs("EPSG:4326")
+            
+            # 3. 获取几何点坐标
+            pt = first_pt_gdf.geometry.iloc[0]
+            lon, lat = pt.x, pt.y
+            
+            # 4. 计算 UTM 带号 (全球通用公式)
+            # floor((经度 + 180) / 6) + 1
+            zone_number = int((lon + 180) / 6) + 1
+            
+            # 5. 判断南北半球
+            base = "326" if lat >= 0 else "327"
+            
+            epsg_code = f"EPSG:{base}{zone_number:02d}"
+            
+            # 打印调试信息，让你放心
+            # print(f"      [Debug] 检测位置: ({lon:.2f}, {lat:.2f}) -> 对应投影: {epsg_code}")
+            
+            return epsg_code
+            
+        except Exception as e:
+            print(f"      [警告] 自动识别投影失败 ({e})，回退至默认 EPSG:32650")
+            return "EPSG:32650"
+            
+        except Exception as e:
+            # 兜底策略：如果数据为空或极度异常，默认返回一个通用值并报警告
+            print(f"      [警告] 自动识别投影失败 ({e})，回退至默认 EPSG:32650")
+            return "EPSG:32650"
 
     def _generate_trajectory(self):
         """
@@ -241,8 +302,9 @@ class PureSoilSampler:
 
     def _plot_result_map(self, region_id, field_name, gdf_samples, gdf_traj, z_masked, transform, src_crs):
         """
-        绘制高分辨率成果图。
-        实现了图例与色条(Colorbar)的强制中心对齐布局。
+        [布局更新]: 绘制可视化图表
+        1. 坐标轴: 使用符号化经纬度 (如 49.454°N), 去除汉字标签。
+        2. 布局: 图例在地图右侧, Colorbar 在地图正下方(水平放置)。
         """
         print(f"      正在绘制可视化图表...")
         
@@ -251,7 +313,7 @@ class PureSoilSampler:
         traj_wgs = gdf_traj.to_crs("EPSG:4326") if gdf_traj is not None else None
         samples_wgs = gdf_samples.to_crs("EPSG:4326")
         
-        # 2. 栅格重投影 (从 UTM 到 WGS84 的图像重采样)
+        # 2. 栅格重投影 (从投影坐标系重采样为经纬度)
         height, width = z_masked.shape
         dst_crs = 'EPSG:4326'
         dst_transform, dst_width, dst_height = calculate_default_transform(
@@ -269,49 +331,57 @@ class PureSoilSampler:
         # 3. 初始化画布 (300 DPI 高清设置)
         fig, ax = plt.subplots(figsize=(12, 9), dpi=300)
         
-        # [布局控制] 右侧留出 25% 的空白区域用于放置图例和色条
-        plt.subplots_adjust(right=0.75) 
+        # [布局控制]: 调整子图边距
+        # right=0.85: 为右侧图例留出约 15% 的宽度
+        # bottom=0.15: 为底部水平色条留出约 15% 的高度
+        plt.subplots_adjust(right=0.85, bottom=0.15)
         
-        # 4. 绘制插值底图 (使用自定义的清新色系)
+        # 4. 绘制插值底图
         dst_bounds = array_bounds(dst_height, dst_width, dst_transform)
         plot_extent = [dst_bounds[0], dst_bounds[2], dst_bounds[1], dst_bounds[3]]
         
-        # 定义颜色链: 宝石蓝 -> 浅蓝 -> 奶黄 -> 珊瑚橙 -> 宝石红
+        # 清新配色
         fresh_colors = ["#2c7bb6", "#abd9e9", "#ffffbf", "#fdae61", "#d7191c"]
         fresh_cmap = LinearSegmentedColormap.from_list("fresh_style", fresh_colors)
         im = ax.imshow(destination, cmap=fresh_cmap, extent=plot_extent, alpha=0.85, origin='upper')
 
-        # 5. 绘制矢量元素 (航线、边界)
+        # 5. 绘制矢量元素
         if traj_wgs is not None:
             traj_wgs.plot(ax=ax, color="gray", linewidth=1, alpha=0.5, linestyle="-", label="飞行轨迹", zorder=2)
         bound_wgs.plot(ax=ax, facecolor="none", edgecolor="black", linewidth=2, linestyle="--", label="农田边界", zorder=3)
         
-        # 6. 绘制采样点 (按分类着色)
+        # 6. 绘制采样点
         color_dict = {'hotPoint': 'red', 'coldPoint': 'blue', 'normalPoint': 'yellow'}
-        label_dict = {'hotPoint': '高值点', 'coldPoint': '低值点', 'normalPoint': '中值点'}
         for cls in ['hotPoint', 'normalPoint', 'coldPoint']:
             sub = samples_wgs[samples_wgs['class'] == cls]
             if not sub.empty:
-                sub.plot(ax=ax, color=color_dict[cls], edgecolor='white', markersize=80, label=label_dict[cls], zorder=10)
+                sub.plot(ax=ax, color=color_dict[cls], edgecolor='white', markersize=80, zorder=10)
 
-        # 7. 装饰坐标轴和标题
-        ax.set_xlabel("经度 (Longitude)")
-        ax.set_ylabel("纬度 (Latitude)")
+        # ========================================================
+        # [修改点]: 坐标轴格式化 (符号化经纬度)
+        # ========================================================
+        
+        # 定义经度格式化函数 (保留3位小数，如 120.300°E)
+        def format_lon(x, pos):
+            return f"{x:.3f}°E" if x >= 0 else f"{abs(x):.3f}°W"
+
+        # 定义纬度格式化函数 (保留3位小数，如 49.454°N)
+        def format_lat(y, pos):
+            return f"{y:.3f}°N" if y >= 0 else f"{abs(y):.3f}°S"
+
+        # 应用自定义格式器
+        ax.xaxis.set_major_formatter(FuncFormatter(format_lon))
+        ax.yaxis.set_major_formatter(FuncFormatter(format_lat))
+        
+        # 移除原有的汉字标签 (经度/纬度)，因为刻度本身已包含方向信息
+        ax.set_xlabel("")
+        ax.set_ylabel("")
+
         ax.set_title(f"土壤采样规划图 - {region_id} ({field_name})", fontsize=14, pad=15)
-        # 禁用科学计数法显示坐标
-        ax.ticklabel_format(useOffset=False, style='plain')
         
         # ========================================================
-        # [布局核心逻辑]: 强制图例与 Colorbar 垂直中心对齐
+        # [布局逻辑 A]: 图例放置在右侧
         # ========================================================
-        
-        # 定义右侧元素的中心轴线 X 坐标 (基于 Figure 坐标系 0-1)
-        RIGHT_CENTER_X = 0.83
-        # 获取主图轴的位置信息 [x0, y0, width, height]
-        pos = ax.get_position() 
-        
-        # A. 绘制图例 (Legend)
-        # 使用 bbox_to_anchor 将图例的'上边缘中心'锚定在指定位置
         legend_elements = [
             Line2D([0], [0], color='black', linestyle='--', lw=2, label='农田边界'),
             Line2D([0], [0], color='gray', lw=1, label='飞行轨迹'),
@@ -319,33 +389,36 @@ class PureSoilSampler:
             Line2D([0], [0], marker='o', color='w', markerfacecolor='yellow', markersize=10, label='中值点'),
             Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=10, label='低值点')
         ]
-        ax.legend(handles=legend_elements, loc='upper center', 
-                  bbox_to_anchor=(RIGHT_CENTER_X, pos.y1), # 垂直对齐主图顶部
-                  bbox_transform=fig.transFigure,
+        
+        # bbox_to_anchor=(1.02, 1.0): 锚点位于主图右边界外侧，顶部对齐
+        ax.legend(handles=legend_elements, loc='upper left', 
+                  bbox_to_anchor=(1.02, 1.0), 
                   title="图例", frameon=True, borderpad=1)
         
-        # B. 绘制色条 (Colorbar)
-        cbar_width = 0.025
-        # 设置色条高度为主图高度的 70%，使其更修长美观
-        cbar_height = pos.height * 0.7
+        # ========================================================
+        # [布局逻辑 B]: 色条(Colorbar)放置在正下方
+        # ========================================================
+        # 获取主图坐标轴的位置 [x0, y0, width, height]
+        pos = ax.get_position()
         
-        # 计算色条左边缘位置，确保其几何中心位于 RIGHT_CENTER_X
-        cbar_left = RIGHT_CENTER_X - (cbar_width / 2)
-        # 设置色条底部与主图底部对齐，避免与上方的图例重叠
-        cbar_bottom = pos.y0
+        # 计算色条位置: 
+        # left/width 与主图对齐
+        # bottom 在主图下方偏移 0.09 (避开X轴刻度)
+        # height 设为 0.03 (细长条)
+        cax_bounds = [pos.x0, pos.y0 - 0.09, pos.width, 0.03]
         
-        # 创建子轴并绘制色条
-        cax = fig.add_axes([cbar_left, cbar_bottom, cbar_width, cbar_height])
-        cbar = plt.colorbar(im, cax=cax)
-        cbar.set_label(f'{field_name} 值', rotation=270, labelpad=15)
+        # 创建子坐标轴并绘制
+        cax = fig.add_axes(cax_bounds)
+        cbar = plt.colorbar(im, cax=cax, orientation='horizontal')
+        cbar.set_label(f'{field_name} 值', labelpad=10)
 
         # 8. 保存结果
         out_png = os.path.join(self.workspace, f"Map_{region_id}_{field_name}.png")
-        # bbox_inches=None 确保我们手动计算的布局不被自动裁切破坏
+        # bbox_inches=None 确保手动布局不被自动裁切破坏
         plt.savefig(out_png, dpi=300, bbox_inches=None) 
         plt.close()
         print(f"      -> 图片已保存: {os.path.basename(out_png)}")
-
+    
     def run(self, region_id="Region", mode="auto", density=1.5, min_count=4, fixed_counts=None, resample_dist=5.0, resolution=2.0):
         """
         主控制函数，串联所有处理步骤。
