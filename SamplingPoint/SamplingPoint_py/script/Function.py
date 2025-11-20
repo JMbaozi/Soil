@@ -418,83 +418,78 @@ class PureSoilSampler:
         plt.savefig(out_png, dpi=300, bbox_inches=None) 
         plt.close()
         print(f"      -> 图片已保存: {os.path.basename(out_png)}")
-    
-    def run(self, region_id="Region", mode="auto", density=1.5, min_count=4, fixed_counts=None, resample_dist=5.0, resolution=2.0):
+
+    def run(self, region_id="Region", mode="auto", density=1, min_count=5, fixed_counts=None, resample_dist=5.0, resolution=5.0):
         """
-        主控制函数，串联所有处理步骤。
+        带性能诊断的运行逻辑
         """
+        import time
+        t_start = time.time()
+        
         print(f"\n=== 开始处理区域: {region_id} ===")
         
-        # 1. 准备阶段：计算采样数量和生成航线
+        # 1. 准备工作
         target_counts, total_num = self._get_target_counts(mode, density, min_count, fixed_counts)
         gdf_traj = self._generate_trajectory()
         
-        # 沿着航线进行重采样，生成候选点集
         if gdf_traj is not None:
             line_geom = gdf_traj.geometry.iloc[0]
             num_points = int(line_geom.length / resample_dist)
             resampled_coords = [line_geom.interpolate(i * resample_dist) for i in range(num_points + 1)]
             gdf_route_pts = gpd.GeoDataFrame(geometry=resampled_coords, crs=self.target_crs)
         else:
-            # 如果无法生成航线（点太少），直接使用原始点
             gdf_route_pts = self.gdf_pts.copy()
+            
+        print(f"--- [准备阶段] 耗时: {time.time() - t_start:.2f}s")
 
-        # 2. 循环处理每一个监测字段
         for field in self.value_fields:
+            t_field_start = time.time()
             print(f"  >>> 处理要素: [{field}] ...")
             try:
-                # A. 插值计算 (全内存操作)
+                # A. 插值
+                t1 = time.time()
                 z_masked, transform, src_crs = self._perform_kriging(field, resolution)
+                print(f"      [1.克里金插值] 耗时: {time.time() - t1:.2f}s (分辨率: {resolution}m)")
                 
-                # B. 采样提取 (全内存操作)
+                # B. 采样
+                t2 = time.time()
                 vals = self._sample_from_memory(gdf_route_pts, z_masked, transform)
-                
-                # C. 数据整理与分类
+                # ... (中间的数据清洗逻辑耗时极短，忽略) ...
                 df_work = gdf_route_pts.copy()
                 df_work['val'] = vals
-                df_work = df_work[~np.isnan(df_work['val'])] # 剔除无效值
-                if len(df_work) == 0: 
-                    print("      [警告] 所有候选点均位于插值范围外，跳过该字段。")
-                    continue
-
-                # 计算分位点并进行三级分类
+                df_work = df_work[~np.isnan(df_work['val'])]
+                if len(df_work) == 0: continue
+                
                 p33 = np.percentile(df_work['val'], 33)
                 p66 = np.percentile(df_work['val'], 66)
                 def classify(v): return 'coldPoint' if v < p33 else ('normalPoint' if v < p66 else 'hotPoint')
                 df_work['class'] = df_work['val'].apply(classify)
                 
-                # D. 空间互斥抽样算法
-                # 目的：在满足数量要求的同时，让采样点在空间上尽可能分散
                 final_list = []
                 area_m2 = self.gdf_bound.area.sum()
-                # 动态计算互斥半径: 约为理论均匀分布间距的 0.6 倍
                 min_dist = math.sqrt(area_m2 / (total_num + 1)) * 0.6
                 
                 for cls, num in target_counts.items():
-                    # 随机打乱候选点
                     pool = df_work[df_work['class'] == cls].sample(frac=1).reset_index(drop=True)
                     selected = []
                     for _, row in pool.iterrows():
                         if len(selected) >= num: break
                         pt = row.geometry
                         is_far = True
-                        # 检查与当前类已选点及全局已选点的距离
                         for s in selected + final_list:
                             if pt.distance(s['geometry']) < min_dist: is_far = False; break
                         if is_far: selected.append(row.to_dict())
-                    
-                    # 如果因距离限制导致数量不足，则放宽限制进行补齐
                     if len(selected) < num:
                         needed = num - len(selected)
                         leftover = pool.iloc[len(selected):len(selected)+needed]
                         if not leftover.empty: selected.extend(leftover.to_dict('records'))
                     final_list.extend(selected)
+                print(f"      [2.智能选点] 耗时: {time.time() - t2:.2f}s")
                 
-                # E. 结果导出
+                # C. 导出
+                t3 = time.time()
                 gdf_final = gpd.GeoDataFrame(final_list, crs=self.target_crs)
                 gdf_wgs = gdf_final.to_crs("EPSG:4326")
-                
-                # 导出 CSV 表格 (包含经纬度坐标)
                 csv_path = os.path.join(self.workspace, f"Coords_{region_id}_{field}.csv")
                 out_df = pd.DataFrame({
                     'ID': range(1, len(gdf_wgs)+1), 'Class': gdf_wgs['class'],
@@ -502,9 +497,7 @@ class PureSoilSampler:
                     'Lat': gdf_wgs.geometry.y.round(6)
                 })
                 out_df.to_csv(csv_path, index=False, encoding='utf_8_sig')
-                print(f"      -> 表格已导出: {os.path.basename(csv_path)}")
                 
-                # F. 存档栅格 (延迟写入，不影响计算流)
                 tif_path = os.path.join(self.workspace, f"Kriging_{region_id}_{field}.tif")
                 with rasterio.open(
                     tif_path, 'w', driver='GTiff',
@@ -513,11 +506,122 @@ class PureSoilSampler:
                     transform=transform, nodata=np.nan
                 ) as dst:
                     dst.write(z_masked.astype('float32'), 1)
+                print(f"      [3.文件保存] 耗时: {time.time() - t3:.2f}s")
                 
-                # G. 执行制图
+                # D. 制图
+                t4 = time.time()
                 self._plot_result_map(region_id, field, gdf_final, gdf_traj, z_masked, transform, src_crs)
+                print(f"      [4.高清制图] 耗时: {time.time() - t4:.2f}s")
+                
+                print(f"   >> 单要素总耗时: {time.time() - t_field_start:.2f}s")
                 
             except Exception as e:
                 print(f"      !! 错误: {e}")
                 import traceback
                 traceback.print_exc()
+        
+        print(f"\n=== 区域处理总耗时: {time.time() - t_start:.2f}s ===")
+
+
+    # def run(self, region_id="Region", mode="auto", density=1.5, min_count=4, fixed_counts=None, resample_dist=5.0, resolution=2.0):
+    #     """
+    #     主控制函数，串联所有处理步骤。
+    #     """
+    #     print(f"\n=== 开始处理区域: {region_id} ===")
+        
+    #     # 1. 准备阶段：计算采样数量和生成航线
+    #     target_counts, total_num = self._get_target_counts(mode, density, min_count, fixed_counts)
+    #     gdf_traj = self._generate_trajectory()
+        
+    #     # 沿着航线进行重采样，生成候选点集
+    #     if gdf_traj is not None:
+    #         line_geom = gdf_traj.geometry.iloc[0]
+    #         num_points = int(line_geom.length / resample_dist)
+    #         resampled_coords = [line_geom.interpolate(i * resample_dist) for i in range(num_points + 1)]
+    #         gdf_route_pts = gpd.GeoDataFrame(geometry=resampled_coords, crs=self.target_crs)
+    #     else:
+    #         # 如果无法生成航线（点太少），直接使用原始点
+    #         gdf_route_pts = self.gdf_pts.copy()
+
+    #     # 2. 循环处理每一个监测字段
+    #     for field in self.value_fields:
+    #         print(f"  >>> 处理要素: [{field}] ...")
+    #         try:
+    #             # A. 插值计算 (全内存操作)
+    #             z_masked, transform, src_crs = self._perform_kriging(field, resolution)
+                
+    #             # B. 采样提取 (全内存操作)
+    #             vals = self._sample_from_memory(gdf_route_pts, z_masked, transform)
+                
+    #             # C. 数据整理与分类
+    #             df_work = gdf_route_pts.copy()
+    #             df_work['val'] = vals
+    #             df_work = df_work[~np.isnan(df_work['val'])] # 剔除无效值
+    #             if len(df_work) == 0: 
+    #                 print("      [警告] 所有候选点均位于插值范围外，跳过该字段。")
+    #                 continue
+
+    #             # 计算分位点并进行三级分类
+    #             p33 = np.percentile(df_work['val'], 33)
+    #             p66 = np.percentile(df_work['val'], 66)
+    #             def classify(v): return 'coldPoint' if v < p33 else ('normalPoint' if v < p66 else 'hotPoint')
+    #             df_work['class'] = df_work['val'].apply(classify)
+                
+    #             # D. 空间互斥抽样算法
+    #             # 目的：在满足数量要求的同时，让采样点在空间上尽可能分散
+    #             final_list = []
+    #             area_m2 = self.gdf_bound.area.sum()
+    #             # 动态计算互斥半径: 约为理论均匀分布间距的 0.6 倍
+    #             min_dist = math.sqrt(area_m2 / (total_num + 1)) * 0.6
+                
+    #             for cls, num in target_counts.items():
+    #                 # 随机打乱候选点
+    #                 pool = df_work[df_work['class'] == cls].sample(frac=1).reset_index(drop=True)
+    #                 selected = []
+    #                 for _, row in pool.iterrows():
+    #                     if len(selected) >= num: break
+    #                     pt = row.geometry
+    #                     is_far = True
+    #                     # 检查与当前类已选点及全局已选点的距离
+    #                     for s in selected + final_list:
+    #                         if pt.distance(s['geometry']) < min_dist: is_far = False; break
+    #                     if is_far: selected.append(row.to_dict())
+                    
+    #                 # 如果因距离限制导致数量不足，则放宽限制进行补齐
+    #                 if len(selected) < num:
+    #                     needed = num - len(selected)
+    #                     leftover = pool.iloc[len(selected):len(selected)+needed]
+    #                     if not leftover.empty: selected.extend(leftover.to_dict('records'))
+    #                 final_list.extend(selected)
+                
+    #             # E. 结果导出
+    #             gdf_final = gpd.GeoDataFrame(final_list, crs=self.target_crs)
+    #             gdf_wgs = gdf_final.to_crs("EPSG:4326")
+                
+    #             # 导出 CSV 表格 (包含经纬度坐标)
+    #             csv_path = os.path.join(self.workspace, f"Coords_{region_id}_{field}.csv")
+    #             out_df = pd.DataFrame({
+    #                 'ID': range(1, len(gdf_wgs)+1), 'Class': gdf_wgs['class'],
+    #                 'Value': gdf_wgs['val'].round(2), 'Lon': gdf_wgs.geometry.x.round(6),
+    #                 'Lat': gdf_wgs.geometry.y.round(6)
+    #             })
+    #             out_df.to_csv(csv_path, index=False, encoding='utf_8_sig')
+    #             print(f"      -> 表格已导出: {os.path.basename(csv_path)}")
+                
+    #             # F. 存档栅格 (延迟写入，不影响计算流)
+    #             tif_path = os.path.join(self.workspace, f"Kriging_{region_id}_{field}.tif")
+    #             with rasterio.open(
+    #                 tif_path, 'w', driver='GTiff',
+    #                 height=z_masked.shape[0], width=z_masked.shape[1],
+    #                 count=1, dtype='float32', crs=self.target_crs, 
+    #                 transform=transform, nodata=np.nan
+    #             ) as dst:
+    #                 dst.write(z_masked.astype('float32'), 1)
+                
+    #             # G. 执行制图
+    #             self._plot_result_map(region_id, field, gdf_final, gdf_traj, z_masked, transform, src_crs)
+                
+    #         except Exception as e:
+    #             print(f"      !! 错误: {e}")
+    #             import traceback
+    #             traceback.print_exc()
