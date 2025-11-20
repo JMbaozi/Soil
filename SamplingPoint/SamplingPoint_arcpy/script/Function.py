@@ -11,20 +11,20 @@ import glob
 from arcpy.sa import *
 
 # ===============================================================================
-# 类: SoilSampler (v13.0 最终集成版)
+# 类: SoilSampler (v13.3 Enhanced Logging)
 # ===============================================================================
 class SoilSampler:
     """
-    SoilSampler v13.0
+    SoilSampler v13.3
     
     [功能描述]:
     自动化土壤采样规划工具。基于无人机能谱数据，结合地统计学原理，生成空间分布均匀且具有代表性的采样方案。
     
     [核心特性]:
     1. [多要素并行]: 可同时处理 Total, K40, Bi214 等多个指标，互不干扰。
-    2. [自动步长]: 集成 '平均最近邻' 算法，自动计算克里金插值的最佳步长(Lag Size)，无需人工干预。
-    3. [栅格直出]: 插值结果直接保存为文件夹中的 .tif 文件，彻底解决数据库文件名截断(Kriging_Regi1)问题。
-    4. [智能抽样]: 使用 '网格分箱 + 距离约束' 算法，物理上强制保证采样点的空间分散性。
+    2. [自动步长]: 集成 '平均最近邻' 算法，自动计算克里金插值的最佳步长(Lag Size)。
+    3. [栅格直出]: 插值结果直接保存为文件夹中的 .tif 文件，彻底解决数据库文件名截断问题。
+    4. [智能抽样]: 使用 '网格分箱 + 距离约束' 算法。如果网格法未收敛，自动切换至 '距离约束随机' 模式，并打印详细日志。
     """
 
     def __init__(self, 
@@ -38,47 +38,41 @@ class SoilSampler:
                  
                  # --- 智能采样参数 ---
                  mode="auto",            # "auto"(按面积算) 或 "fixed"(固定数量)
-                 sampling_density=1.5,   # 密度: 每公顷采样的点数 (仅auto模式生效)
+                 sampling_density=1.5,   # 密度: 每公顷采样的点数
                  min_sample_count=4,     # 保底: 无论地块多小，最少采样的点数
                  
-                 # 比例配置: 决定各分类在总采样数中的占比
+                 # 比例配置
                  ratio_config={          
-                     "hotPoint": 0.4,    # 高值区 (重点)
-                     "coldPoint": 0.4,   # 低值区 (重点)
-                     "normalPoint": 0.2  # 中值区 (参考)
+                     "hotPoint": 0.4,    # 高值区
+                     "coldPoint": 0.4,   # 低值区
+                     "normalPoint": 0.2  # 中值区
                  },
                  
-                 # --- 固定模式参数 (仅mode="fixed"生效) ---
+                 # --- 固定模式参数 ---
                  fixed_counts={"hotPoint": 5, "coldPoint": 5, "normalPoint": 3},
                  fixed_grid_size=100,    
                  
                  # --- 算法参数 ---
-                 kriging_model_str="SPHERICAL", # 插值模型 (SPHERICAL 球面 / EXPONENTIAL 指数)
-                 kriging_range="AUTO",          # 步长设置: "AUTO"自动计算，或填具体数字(如 3.35)
-                 line_point_distance="5 Meters",# 航线重采样间隔
+                 kriging_model_str="SPHERICAL", 
+                 kriging_range="AUTO",          
+                 line_point_distance="5 Meters",
                  classification_method="quantile", 
-                 symbology_template_lyrx=None,  # 样式模板路径
-                 overwrite=True):               # 是否覆盖
+                 symbology_template_lyrx=None,  
+                 overwrite=True):               
         
-        # 1. 基础路径赋值
         self.workspace = workspace
         self.overwrite = overwrite
         
-        # 定义栅格输出文件夹 (餐厅): 存放最终 .tif
+        # 定义输出文件夹
         self.grid_folder = os.path.join(os.path.dirname(workspace), "Grid")
-        # 定义临时缓存文件夹 (垃圾桶): 存放 ArcGIS 中间过程文件
         self.scratch_folder = os.path.join(os.path.dirname(workspace), "_scratch_trash")
         
-        # 初始化环境 (创建文件夹、设置工作空间)
+        # 初始化环境
         self._setup_environment()
         
-        # 2. 参数标准化
-        if isinstance(value_fields, str):
-            self.value_fields = [value_fields]
-        else:
-            self.value_fields = value_fields
+        if isinstance(value_fields, str): self.value_fields = [value_fields]
+        else: self.value_fields = value_fields
             
-        # 3. 保存配置
         self.batch_config = batch_config
         self.output_utm_sr = output_utm_sr
         self.mode = mode
@@ -87,29 +81,22 @@ class SoilSampler:
         self.ratio_config = ratio_config
         self.fixed_counts = fixed_counts
         self.fixed_grid_size = fixed_grid_size
-        
         self.time_field = time_field
         self.line_point_distance = line_point_distance
         self.classification_method = classification_method
         self.symbology_template_lyrx = symbology_template_lyrx
-        
         self.kriging_model_str = kriging_model_str
         self.kriging_range_param = kriging_range 
-        
         self.utm_sr = self._resolve_output_sr(output_utm_sr)
 
     def _setup_environment(self):
-        """
-        [系统功能] 初始化 ArcPy 环境与文件夹
-        """
+        """初始化 ArcPy 环境与文件夹"""
         try:
-            # 创建必要的文件夹
             if not os.path.exists(self.grid_folder): os.makedirs(self.grid_folder)
             if not os.path.exists(self.scratch_folder): os.makedirs(self.scratch_folder)
             
             arcpy.env.workspace = self.workspace
-            # [关键]: 将临时空间强制指向 _scratch_trash 文件夹
-            # 这能防止 Kriging_Regi1 等垃圾文件出现在 GDB 或 Grid 文件夹中
+            # 强制临时空间指向物理文件夹
             arcpy.env.scratchWorkspace = self.scratch_folder
             arcpy.env.overwriteOutput = self.overwrite
             
@@ -119,17 +106,13 @@ class SoilSampler:
             raise Exception(f"设置工作空间失败: {e}")
 
     def _resolve_output_sr(self, sr_input):
-        """[辅助功能] 解析坐标系"""
         if not sr_input: return None
         try: return arcpy.SpatialReference(sr_input)
         except: return None
 
     def _cleanup_junk_files(self):
-        """
-        [辅助功能] 清理残留的临时文件
-        """
+        """清理残留文件"""
         try:
-            # 清理 GDB 内可能残留的栅格
             arcpy.env.workspace = self.workspace
             junk = arcpy.ListRasters("Kriging_*")
             if junk:
@@ -137,50 +120,44 @@ class SoilSampler:
                     try: arcpy.management.Delete(r)
                     except: pass
             
-            # 清理 Grid 文件夹中可能的临时文件
             if os.path.exists(self.grid_folder):
                 for f in os.listdir(self.grid_folder):
                     if f.startswith("t_") and f.endswith(".tif"):
                         try: os.remove(os.path.join(self.grid_folder, f))
                         except: pass
                         
-            # 清空垃圾桶文件夹
             if os.path.exists(self.scratch_folder):
                 try: shutil.rmtree(self.scratch_folder)
                 except: pass
         except: pass
 
     def _calculate_optimal_lag_size(self, point_fc):
-        """
-        [算法] 自动计算最佳步长 (Lag Size)
-        原理: 使用 '平均最近邻' 工具，计算点与点之间的平均观测距离。
-        """
+        """自动计算最佳步长"""
         try:
             result = arcpy.stats.AverageNearestNeighbor(point_fc, "EUCLIDEAN_DISTANCE")
             avg_distance = float(result.getOutput(4))
             return round(avg_distance, 6)
         except Exception as e:
-            print(f"    !! 自动计算步长失败: {e}，将使用默认值 300。")
+            print(f"    !! 自动计算步长失败: {e}，使用默认值 300。")
             return 300.0
 
     def _calculate_smart_params(self, farmland_fc, field_name):
         """
-        [算法] 智能计算采样数量与网格
-        原理: 
-        1. 采样数 = 面积 * 密度。
-        2. 推荐网格 = sqrt(面积 / 采样数)。
+        [算法] 智能计算采样数量
         """
         area_sq_meters = 0
-        with arcpy.da.SearchCursor(farmland_fc, ["SHAPE@AREA"]) as cursor:
-            for row in cursor: area_sq_meters += row[0]
+        # 使用测地线面积计算真实的地球面积
+        with arcpy.da.SearchCursor(farmland_fc, ["SHAPE@"]) as cursor:
+            for row in cursor:
+                geom = row[0]
+                area_sq_meters += geom.getArea("GEODESIC", "SQUAREMETERS")
+        
         area_ha = area_sq_meters / 10000.0
         
-        # 计算总数
         total_needed = int(math.ceil(area_ha * self.sampling_density))
         if total_needed < self.min_sample_count:
             total_needed = self.min_sample_count
             
-        # 分配比例
         current_counts = {}
         allocated = 0
         for cls, ratio in self.ratio_config.items():
@@ -193,13 +170,13 @@ class SoilSampler:
              k = list(current_counts.keys())[0]
              current_counts[k] += (total_needed - allocated)
             
-        # 计算网格
         if total_needed > 0:
             suggested_grid = math.sqrt(area_sq_meters / total_needed) * 0.8
         else:
             suggested_grid = 100
             
-        print(f"      [智能参数] 农田:{area_ha:.2f}ha | 计划采样:{sum(current_counts.values())} | 网格:{suggested_grid:.1f}m")
+        # [日志] 打印智能计算结果
+        print(f"      [智能参数] 农田:{area_ha:.2f}ha | 计划:{sum(current_counts.values())}点 | 目标间距(网格):{suggested_grid:.1f}m")
         return current_counts, suggested_grid
 
     def _get_distance(self, p1, p2):
@@ -214,10 +191,8 @@ class SoilSampler:
 
     def _sample_via_grid_binning(self, input_fc, counts_config, start_grid_size):
         """
-        [算法] 内存网格分箱抽样 (Grid Binning)
-        原理: 在内存中建立虚拟网格，并加入硬性距离约束，防止点位过近。
+        [核心算法] 网格分箱抽样 + 距离约束保底
         """
-        # 1. 读取数据到内存
         data_pool = []
         with arcpy.da.SearchCursor(input_fc, ["OID@", "SHAPE@XY", "class"]) as cursor:
             for row in cursor:
@@ -226,20 +201,19 @@ class SoilSampler:
         if not data_pool: return []
 
         total_needed = sum(counts_config.values())
+        
+        # 硬性最小距离
+        HARD_MIN_DISTANCE = start_grid_size * 0.5
         final_oids = []
         
-        # 硬性最小距离：设为目标网格的一半，防止极端贴近
-        HARD_MIN_DISTANCE = start_grid_size * 0.5
-        
-        # 2. 自适应网格尝试 (最多15次)
+        # 1. 自适应网格尝试
         current_grid = start_grid_size
         for attempt in range(15):
-            # 分箱
             grid = {}
             for pt in data_pool:
                 k = (int(pt["y"]/current_grid), int(pt["x"]/current_grid))
                 if k not in grid: grid[k] = {cls: [] for cls in counts_config}
-                if pt["cls"] in grid[k]: grid[k][pt["cls"]].append(pt) # 存对象
+                if pt["cls"] in grid[k]: grid[k][pt["cls"]].append(pt) 
 
             if len(grid) < total_needed:
                 current_grid *= 0.85; continue
@@ -250,7 +224,6 @@ class SoilSampler:
             priority = ["hotPoint", "coldPoint", "normalPoint"]
             success = True
             
-            # 分层抽样
             for cls in priority:
                 if cls not in counts_config: continue
                 needed = counts_config[cls]
@@ -261,9 +234,7 @@ class SoilSampler:
                 
                 picked_keys = random.sample(candidates, needed)
                 for k in picked_keys:
-                    # 随机选点
                     chosen_pt = random.choice(grid[k][cls])
-                    # 额外检查距离 (防止边缘效应)
                     if self._is_valid_distance(chosen_pt, round_points, HARD_MIN_DISTANCE):
                         round_points.append(chosen_pt)
                         round_oids.append(chosen_pt["oid"])
@@ -274,14 +245,18 @@ class SoilSampler:
             
             if success and len(round_oids) == total_needed:
                 final_oids = round_oids
+                # print(f"      -> 网格法成功! 最小间距 > {HARD_MIN_DISTANCE:.1f}m")
                 break
             else:
                 current_grid *= 0.85
 
-        # 3. 保底机制 (距离约束随机)
+        # 2. 保底机制 (如果网格法失败)
         if not final_oids:
-            print(f"      -> 网格法未收敛，切换至距离约束随机模式...")
-            for retry in range(50): # 尝试50次随机组合
+            # [日志] 打印切换提示
+            print(f"      -> 网格法未收敛，切换至[距离约束随机]模式...")
+            print(f"      -> 正在寻找满足 {HARD_MIN_DISTANCE:.1f}米 间距的组合...")
+            
+            for retry in range(50): 
                 temp_pts = []; temp_ids = []; failed = False
                 for cls in ["hotPoint", "coldPoint", "normalPoint"]:
                     if cls not in counts_config: continue
@@ -294,11 +269,14 @@ class SoilSampler:
                             temp_pts.append(p); temp_ids.append(p["oid"]); cnt += 1
                         if cnt == needed: break
                     if cnt < needed: failed = True; break
-                if not failed: final_oids = temp_ids; break
+                if not failed: 
+                    final_oids = temp_ids
+                    # [日志] 打印成功尝试次数
+                    print(f"      -> 成功找到方案! (尝试第 {retry+1} 次)")
+                    break
             
-            # 最后的底线: 纯随机
             if not final_oids:
-                print("      !! 警告: 无法满足距离约束，执行纯随机。")
+                print(f"      !! 警告: 无法满足 {HARD_MIN_DISTANCE:.1f}m 间距。执行纯随机。")
                 for cls, num in counts_config.items():
                      oids = [p["oid"] for p in data_pool if p["cls"] == cls]
                      final_oids.extend(random.sample(oids, min(len(oids), num)))
@@ -306,19 +284,16 @@ class SoilSampler:
         return final_oids
 
     def run_batch(self):
-        """
-        [主程序] 批量处理入口
-        """
-        print(f"开始批量处理 (v13.0 最终集成版)...")
-        # 预先清理垃圾桶
-        self._cleanup_junk_files()
+        """[主程序] 批量处理入口"""
+        print(f"开始批量处理 (v13.3 日志增强版)...")
+        self._cleanup_junk_files() # 预清理
         if not os.path.exists(self.scratch_folder): os.makedirs(self.scratch_folder)
 
         for region in self.batch_config:
             region_id = region["id"]
             print(f"\n=== 正在处理区域: {region_id} ===")
             
-            # 1. 生成基础几何 (存入 GDB)
+            # 1. 基础几何
             uav_line_base = f"Route_{region_id}"
             line_points_base = f"Points_{region_id}"
             try:
@@ -329,7 +304,7 @@ class SoilSampler:
             except Exception as e:
                 print(f"!! 基础几何生成失败: {e}"); continue
 
-            # 2. 自动计算步长 (Auto Lag Size)
+            # 2. 自动步长
             current_lag_size = 300.0
             if self.kriging_range_param == "AUTO":
                 print(f"  [自动分析] 计算点间距...")
@@ -340,11 +315,10 @@ class SoilSampler:
 
             current_kriging_model = KrigingModelOrdinary(self.kriging_model_str, current_lag_size)
 
-            # --- 内层循环: 遍历要素 ---
+            # --- 遍历要素 ---
             for field_name in self.value_fields:
                 print(f"\n  >>> 正在处理要素: [{field_name}] ...")
                 
-                # 定义文件名 (栅格存 Grid，矢量存 GDB)
                 kriging_tif_name = f"Kriging_{region_id}_{field_name}.tif"
                 kriging_tif_path = os.path.join(self.grid_folder, kriging_tif_name)
                 
@@ -353,9 +327,7 @@ class SoilSampler:
                 final_sample_fc = f"Sample_{region_id}_{field_name}"
 
                 try:
-                    # -------------------------------------------------
-                    # A. 克里金插值 (Direct CopyRaster 方案)
-                    # -------------------------------------------------
+                    # A. 插值
                     arcpy.env.extent = region["farmland"]
                     arcpy.env.mask = region["farmland"]
                     
@@ -364,32 +336,20 @@ class SoilSampler:
                             try: arcpy.management.Delete(kriging_tif_path)
                             except: os.remove(kriging_tif_path)
                         
-                        # 1. 计算 Kriging (中间临时文件自动进入 _scratch_trash)
                         krig_obj = Kriging(region["points"], field_name, current_kriging_model)
+                        arcpy.management.CopyRaster(krig_obj, kriging_tif_path, pixel_type="32_BIT_FLOAT", format="TIFF")
                         
-                        # 2. CopyRaster 直接保存为 TIFF (绕过 GDB 命名限制)
-                        arcpy.management.CopyRaster(
-                            in_raster=krig_obj, 
-                            out_rasterdataset=kriging_tif_path,
-                            pixel_type="32_BIT_FLOAT",
-                            format="TIFF"
-                        )
+                        # [日志] 更新插值成功提示
                         print(f"      -> 插值成功: {kriging_tif_name}")
                         
-                        # 3. 计算统计值 (优化显示)
                         try: arcpy.management.CalculateStatistics(kriging_tif_path)
                         except: pass
-                        
                     except Exception as e:
-                        print(f"      !! 插值失败: {e}")
-                        print(arcpy.GetMessages(2)) # 打印底层错误
-                        raise
+                        print(f"      !! 插值失败: {e}"); raise
                     finally: 
                         arcpy.env.mask = ""; arcpy.env.extent = ""
 
-                    # -------------------------------------------------
-                    # B. 提取与分类 (从 TIFF 提取)
-                    # -------------------------------------------------
+                    # B. 提取
                     if arcpy.Exists(working_points): arcpy.management.Delete(working_points)
                     arcpy.management.CopyFeatures(line_points_base, working_points)
                     ExtractMultiValuesToPoints(working_points, [[kriging_tif_path, "krig_val"]], "NONE")
@@ -408,9 +368,7 @@ class SoilSampler:
                             else: row[1] = "hotPoint"
                             cursor.updateRow(row)
                     
-                    # -------------------------------------------------
-                    # C. 投影与抽样
-                    # -------------------------------------------------
+                    # C. 抽样
                     if arcpy.Exists(projected_points): arcpy.management.Delete(projected_points)
                     arcpy.management.Project(working_points, projected_points, self.utm_sr)
                     
@@ -420,9 +378,7 @@ class SoilSampler:
                     sel_oids = self._sample_via_grid_binning(projected_points, t_counts, start_grid)
                     if not sel_oids: continue
 
-                    # -------------------------------------------------
-                    # D. 导出数据 (GDB)
-                    # -------------------------------------------------
+                    # D. 导出
                     print(f"      4. 导出采样点...")
                     sql = f"OBJECTID IN ({','.join(map(str, sel_oids))})"
                     if arcpy.Exists("tmp_exp"): arcpy.management.Delete("tmp_exp")
@@ -431,9 +387,7 @@ class SoilSampler:
                     arcpy.management.CopyFeatures("tmp_exp", final_sample_fc)
                     arcpy.management.Delete("tmp_exp")
 
-                    # -------------------------------------------------
-                    # E. 应用样式
-                    # -------------------------------------------------
+                    # E. 样式
                     if self.symbology_template_lyrx and arcpy.Exists(self.symbology_template_lyrx):
                         time.sleep(0.5); arcpy.ClearWorkspaceCache_management()
                         out_lyrx = os.path.join(os.path.dirname(self.workspace), f"{final_sample_fc}.lyrx")
@@ -449,9 +403,7 @@ class SoilSampler:
                         if os.path.exists(tpl_copy): os.remove(tpl_copy)
                         print(f"      -> 样式已应用: {os.path.basename(out_lyrx)}")
 
-                    # -------------------------------------------------
-                    # F. 导出 CSV
-                    # -------------------------------------------------
+                    # F. CSV
                     try:
                         csv_name = f"Coords_{region_id}_{field_name}.csv"
                         csv_path = os.path.join(os.path.dirname(self.workspace), csv_name)
@@ -466,13 +418,11 @@ class SoilSampler:
                                     v = f"{r[3]:.2f}" if r[3] else "0"
                                     writer.writerow([r[0], r[2], f"{pt.X:.6f}", f"{pt.Y:.6f}", v])
                         print(f"      -> 表格已导出: {csv_name}")
-                    except Exception as e:
-                        print(f"      (CSV错误: {e})")
+                    except Exception as e: print(f"      (CSV错误: {e})")
 
                 except Exception as e:
                     print(f"    !! 处理失败: {e}"); arcpy.env.mask = ""; continue
         
-        # 运行结束，删除垃圾桶文件夹
         self._cleanup_junk_files()
         print("\n!! 采样任务全部完成 !!")
 
